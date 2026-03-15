@@ -34,6 +34,12 @@ scripts/
   health_check.sh         # Cron-based liveness check with alerting
   upload_model.sh         # Upload a cloned model directory to MinIO
   sync_model.sh           # Pull a model from MinIO to local disk
+
+k8s/                      # Alternative: deploy on Kubernetes (K3s)
+  vllm-embedding-values.yaml   # Helm values for vLLM embedding
+  vllm-chat-values.yaml        # Helm values for vLLM chat
+  litellm-values.yaml           # Helm values for LiteLLM proxy
+  litellm.yaml                  # Raw K8s manifests (alternative to Helm)
 ```
 
 ## Table of Contents
@@ -45,6 +51,7 @@ scripts/
 - [Centralized Model Storage with MinIO](#centralized-model-storage-with-minio-optional)
 - [Part 1: Local Testing](#part-1-local-testing)
 - [Part 2: Production Deployment](#part-2-production-deployment)
+- [Kubernetes Deployment (K3s)](#kubernetes-deployment-k3s)
 - [Part 3: Client Integration](#part-3-client-integration)
 - [Monitoring and Observability](#monitoring-and-observability)
 - [Quantization: Running Larger Models](#quantization-running-larger-models)
@@ -607,6 +614,159 @@ cd /opt/gateway && docker compose exec nginx nginx -s reload
 2. If HTTPS is required: "Can you issue an internal TLS certificate for `llm.example.com`?"
 
 Users then connect to `http://llm.example.com` (or `https://`) with no port numbers.
+
+---
+
+## Kubernetes Deployment (K3s)
+
+If your DGX Spark nodes are part of a K3s cluster, you can deploy vLLM and LiteLLM using Helm charts and K8s manifests instead of Docker Compose. Kubernetes handles service discovery, load balancing, and health checks — no nginx or manual IP management needed.
+
+### Architecture
+
+```mermaid
+graph TD
+    Users["Users<br/>(OpenAI SDK, curl, apps)"]
+    Traefik["Traefik Ingress<br/>llm.example.com"]
+    LiteLLM["LiteLLM Service<br/>litellm.llm.svc:4000"]
+    Embed["vLLM Pod — Embedding<br/>dgx-spark-1"]
+    Chat["vLLM Pod — Chat<br/>dgx-spark-2"]
+    MinIO["MinIO<br/>(model store)"]
+
+    Users --> Traefik
+    Traefik --> LiteLLM
+    LiteLLM --> Embed
+    LiteLLM --> Chat
+    MinIO -.->|"init container<br/>mc mirror"| Embed
+    MinIO -.->|"init container<br/>mc mirror"| Chat
+
+    style Traefik fill:#9b59b6,stroke:#8e44ad,color:#fff
+    style LiteLLM fill:#f39c12,stroke:#c87f0a,color:#fff
+    style Embed fill:#3498db,stroke:#2980b9,color:#fff
+    style Chat fill:#2ecc71,stroke:#27ae60,color:#fff
+    style MinIO fill:#e74c3c,stroke:#c0392b,color:#fff
+```
+
+### Prerequisites
+
+**1. Add DGX Spark nodes as K3s agents:**
+
+```bash
+# On each DGX Spark node (replace with your K3s server URL and token)
+curl -sfL https://get.k3s.io | K3S_URL=https://<k3s-server>:6443 \
+  K3S_TOKEN=<node-token> sh -s - agent
+```
+
+**2. Install NVIDIA Container Toolkit for containerd (K3s default):**
+
+```bash
+# On each DGX Spark node
+# Follow: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+nvidia-ctk runtime configure --runtime=containerd
+sudo systemctl restart k3s-agent
+```
+
+**3. Label the nodes:**
+
+```bash
+kubectl label node dgx-spark-1 node-role=embedding
+kubectl label node dgx-spark-2 node-role=chat
+```
+
+**4. Create namespace and secrets:**
+
+```bash
+kubectl create namespace llm
+
+# MinIO credentials (for model download init container)
+kubectl create secret generic minio-credentials -n llm \
+  --from-literal=access-key=minioadmin \
+  --from-literal=secret-key=<your-minio-password>
+
+# LiteLLM master key
+kubectl create secret generic litellm-secrets -n llm \
+  --from-literal=master-key=$(openssl rand -hex 32)
+```
+
+### Deploy vLLM (Helm)
+
+The `k8s/vllm-*-values.yaml` files use the [official vLLM Helm chart](https://docs.vllm.ai/en/stable/examples/online_serving/chart-helm) with DGX Spark-specific customizations:
+
+- NVIDIA's `nvcr.io/nvidia/vllm` image (not upstream `vllm/vllm-openai`)
+- `--enforce-eager` flag (required for sm_121)
+- `nodeSelector` to pin each model to its dedicated DGX Spark node
+- Init container that syncs model weights from MinIO to the PVC on first boot
+- Memory limits set to 120 Gi (leaving ~8 GB for kubelet/OS on the 128 GB node)
+
+```bash
+# Embedding model on DGX Spark #1
+helm install vllm-embedding \
+  oci://ghcr.io/vllm-project/helm-charts/vllm \
+  -f k8s/vllm-embedding-values.yaml \
+  -n llm
+
+# Chat model on DGX Spark #2
+helm install vllm-chat \
+  oci://ghcr.io/vllm-project/helm-charts/vllm \
+  -f k8s/vllm-chat-values.yaml \
+  -n llm
+
+# Verify pods are running (may take a few minutes for model download + load)
+kubectl get pods -n llm -w
+```
+
+### Deploy LiteLLM (Helm)
+
+LiteLLM has an [official Helm chart](https://github.com/BerriAI/litellm/tree/main/deploy/charts/litellm-helm) that includes a bundled Postgres database for usage tracking and API key management. The `k8s/litellm-values.yaml` file configures it to route to the vLLM services by K8s DNS:
+
+| Model name | Backend service URL |
+|---|---|
+| `qwen3-embed` | `http://vllm-embedding-vllm.llm.svc.cluster.local:80/v1` |
+| `qwen3-chat` | `http://vllm-chat-vllm.llm.svc.cluster.local:80/v1` |
+
+```bash
+# Clone the chart (no OCI registry available at time of writing)
+git clone https://github.com/BerriAI/litellm.git /tmp/litellm
+
+# Install with a generated master key and database password
+helm install litellm /tmp/litellm/deploy/charts/litellm-helm \
+  -f k8s/litellm-values.yaml \
+  -n llm \
+  --set masterkey=$(openssl rand -hex 32) \
+  --set postgresql.auth.password=$(openssl rand -hex 16) \
+  --set postgresql.auth.postgres-password=$(openssl rand -hex 16)
+```
+
+By default the service is `ClusterIP` on port 4000. To expose it externally, enable the `ingress` block in `k8s/litellm-values.yaml` (K3s ships with Traefik).
+
+> **Alternative:** If you don't need a database (no usage tracking or key management), `k8s/litellm.yaml` provides lightweight raw K8s manifests with a NodePort service on port 30400.
+
+### Verify
+
+```bash
+# Port-forward for quick local test
+kubectl port-forward svc/litellm 4000:4000 -n llm &
+
+# Retrieve the master key (Helm-generated secret)
+export LITELLM_KEY=$(kubectl get secret -n llm \
+  -l app.kubernetes.io/instance=litellm \
+  -o jsonpath='{.items[0].data.masterkey}' | base64 -d)
+
+# Smoke test
+python scripts/smoke_test.py --mode gateway \
+  --base-url http://localhost:4000/v1 \
+  --api-key "$LITELLM_KEY"
+```
+
+### Docker Compose vs. K3s — When to Use Which
+
+| | Docker Compose (Part 2) | Kubernetes / K3s |
+|---|---|---|
+| **Setup complexity** | Lower — `docker compose up` per node | Higher — K3s cluster, Helm, NVIDIA runtime |
+| **Service discovery** | Manual IPs in LiteLLM config | Automatic via K8s DNS |
+| **Health checks / restart** | Docker `restart: unless-stopped` | K8s liveness/readiness probes, self-healing |
+| **Model delivery** | `git clone` or `mc mirror` to each node | Init container syncs from MinIO automatically |
+| **Scaling** | Manual | Horizontal pod autoscaling (if you add more nodes) |
+| **Best for** | 2 nodes, quick setup, air-gapped simplicity | Existing K3s cluster, automated ops, future growth |
 
 ---
 

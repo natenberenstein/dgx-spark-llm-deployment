@@ -1,0 +1,128 @@
+# Helm values: vLLM — Chat completion model on DGX Spark #2
+#
+# Chart:   oci://ghcr.io/vllm-project/helm-charts/vllm
+# Docs:    https://docs.vllm.ai/en/stable/examples/online_serving/chart-helm
+#
+# Install:
+#   helm install vllm-chat \
+#     oci://ghcr.io/vllm-project/helm-charts/vllm \
+#     -f k8s/vllm-chat-values.yaml \
+#     -n llm
+#
+# Prerequisites:
+#   - DGX Spark #2 joined to K3s cluster and labeled:
+#       kubectl label node dgx-spark-2 node-role=chat
+#   - NVIDIA Container Toolkit + nvidia RuntimeClass configured on the node
+#   - MinIO credentials secret created (same as embedding)
+
+image:
+  repository: "nvcr.io/nvidia/vllm"
+  tag: "26.02-py3"
+  command:
+    - "vllm"
+    - "serve"
+    - "/data/"
+    - "--served-model-name"
+    - "Qwen3-8B"
+    - "--enforce-eager"
+    - "--dtype"
+    - "float16"
+    - "--host"
+    - "0.0.0.0"
+    - "--port"
+    - "8000"
+    - "--max-model-len"
+    - "8192"
+    - "--max-num-seqs"
+    - "256"
+    - "--gpu-memory-utilization"
+    - "0.85"
+
+containerPort: 8000
+servicePort: 80
+
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: 10
+    memory: "120Gi"
+    nvidia.com/gpu: 1
+  limits:
+    cpu: 20
+    memory: "120Gi"
+    nvidia.com/gpu: 1
+
+gpuModels:
+  - "NVIDIA GB10"
+
+nodeSelector:
+  node-role: "chat"
+
+extraInit:
+  modelDownload:
+    enabled: true
+    image:
+      repository: "minio/mc"
+      tag: "latest"
+      pullPolicy: "IfNotPresent"
+    waitContainer:
+      command: ["/bin/sh"]
+      args:
+        - "-c"
+        - |
+          mc alias set store "$AWS_ENDPOINT_URL" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" && \
+          mc mirror --overwrite store/models/Qwen3-8B /data/
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: access-key
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: secret-key
+        - name: AWS_ENDPOINT_URL
+          value: "http://minio.llm.svc.cluster.local:9000"
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 80
+
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  failureThreshold: 60
+  periodSeconds: 10
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  failureThreshold: 3
+  periodSeconds: 15
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  failureThreshold: 3
+  periodSeconds: 10
+
+deploymentStrategy: {}
+configs: {}
+secrets: {}
+externalConfigs: []
+customObjects: []
+maxUnavailablePodDisruptionBudget: ""
+
+# -- To serve a quantized 72B model instead, change:
+#   1. image.command: replace "Qwen3-8B" with "Qwen3-72B-AWQ" (both served-model-name and data path)
+#   2. extraInit.modelDownload.waitContainer.args: update the MinIO path
+#   3. gpu-memory-utilization: keep at 0.85 (INT4 72B ≈ 36 GB, leaves ~73 GB for KV cache)
+#   4. max-model-len: lower to 4096 if memory is tight

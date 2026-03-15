@@ -1,0 +1,156 @@
+# Helm values: vLLM — Embedding model on DGX Spark #1
+#
+# Chart:   oci://ghcr.io/vllm-project/helm-charts/vllm
+# Docs:    https://docs.vllm.ai/en/stable/examples/online_serving/chart-helm
+#
+# Install:
+#   helm install vllm-embedding \
+#     oci://ghcr.io/vllm-project/helm-charts/vllm \
+#     -f k8s/vllm-embedding-values.yaml \
+#     -n llm
+#
+# Prerequisites:
+#   - DGX Spark #1 joined to K3s cluster and labeled:
+#       kubectl label node dgx-spark-1 node-role=embedding
+#   - NVIDIA Container Toolkit + nvidia RuntimeClass configured on the node
+#   - MinIO credentials secret created:
+#       kubectl create secret generic minio-credentials -n llm \
+#         --from-literal=access-key=minioadmin \
+#         --from-literal=secret-key=<your-password>
+#   - MinIO accessible from the cluster (or models pre-loaded on the PVC)
+
+# -- NVIDIA's DGX Spark-optimized vLLM image (not upstream vllm-openai).
+# Check https://build.nvidia.com/spark/vllm for the latest tag.
+image:
+  repository: "nvcr.io/nvidia/vllm"
+  tag: "26.02-py3"
+  command:
+    - "vllm"
+    - "serve"
+    - "/data/"                        # PVC mount — populated by init container
+    - "--served-model-name"
+    - "Qwen3-Embedding-8B"           # name reported by /v1/models
+    - "--task"
+    - "embed"
+    - "--enforce-eager"               # REQUIRED on DGX Spark (sm_121)
+    - "--dtype"
+    - "float16"
+    - "--host"
+    - "0.0.0.0"
+    - "--port"
+    - "8000"
+    - "--max-model-len"
+    - "8192"
+    - "--max-num-seqs"
+    - "256"
+    - "--gpu-memory-utilization"
+    - "0.85"                          # ~109 GB — leave headroom for K8s/OS
+  # S3 env vars are only needed if you use s3:// URI directly in the command
+  # instead of the init container. Uncomment and remove extraInit if preferred.
+  # env:
+  #   - name: AWS_ACCESS_KEY_ID
+  #     valueFrom:
+  #       secretKeyRef:
+  #         name: minio-credentials
+  #         key: access-key
+  #   - name: AWS_SECRET_ACCESS_KEY
+  #     valueFrom:
+  #       secretKeyRef:
+  #         name: minio-credentials
+  #         key: secret-key
+  #   - name: AWS_ENDPOINT_URL
+  #     value: "http://minio.llm.svc.cluster.local:9000"
+
+containerPort: 8000
+servicePort: 80
+
+replicaCount: 1
+
+# -- DGX Spark has 128 GB unified memory shared between CPU and GPU.
+# The K8s cgroup memory limit must be high enough to accommodate vLLM's
+# --gpu-memory-utilization allocation, otherwise the pod gets OOM-killed.
+# With 0.85 utilization: ~109 GB GPU + process overhead ≈ 115 GB.
+resources:
+  requests:
+    cpu: 10
+    memory: "120Gi"
+    nvidia.com/gpu: 1
+  limits:
+    cpu: 20                           # all 20 cores
+    memory: "120Gi"                   # leaves ~8 GB for kubelet/OS
+    nvidia.com/gpu: 1
+
+gpuModels:
+  - "NVIDIA GB10"
+
+# -- Pin to the DGX Spark node labeled for embedding.
+# Label the node: kubectl label node dgx-spark-1 node-role=embedding
+nodeSelector:
+  node-role: "embedding"
+
+# -- Init container: download model from MinIO to the PVC.
+# Uses `mc mirror` (MinIO client) which is idempotent — fast on subsequent
+# restarts if the model is already present.
+extraInit:
+  modelDownload:
+    enabled: true
+    image:
+      repository: "minio/mc"
+      tag: "latest"
+      pullPolicy: "IfNotPresent"
+    waitContainer:
+      command: ["/bin/sh"]
+      args:
+        - "-c"
+        - |
+          mc alias set store "$AWS_ENDPOINT_URL" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" && \
+          mc mirror --overwrite store/models/Qwen3-Embedding-8B /data/
+      env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: access-key
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: minio-credentials
+              key: secret-key
+        - name: AWS_ENDPOINT_URL
+          value: "http://minio.llm.svc.cluster.local:9000"
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 1
+  targetCPUUtilizationPercentage: 80
+
+# -- vLLM takes 1-3 minutes to load the model on DGX Spark.
+# The startup probe gives it up to 10 minutes (60 * 10s) before failing.
+startupProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  failureThreshold: 60
+  periodSeconds: 10
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  failureThreshold: 3
+  periodSeconds: 15
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  failureThreshold: 3
+  periodSeconds: 10
+
+deploymentStrategy: {}
+configs: {}
+secrets: {}
+externalConfigs: []
+customObjects: []
+maxUnavailablePodDisruptionBudget: ""

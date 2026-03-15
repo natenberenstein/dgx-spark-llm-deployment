@@ -1,0 +1,168 @@
+# Helm values: LiteLLM Proxy — API gateway for vLLM backends
+#
+# Chart:   https://github.com/BerriAI/litellm/tree/main/deploy/charts/litellm-helm
+# Docs:    https://docs.litellm.ai/docs/proxy/deploy
+#
+# Install:
+#   helm install litellm ./litellm-helm \
+#     -f k8s/litellm-values.yaml \
+#     -n llm \
+#     --set masterkey=$(openssl rand -hex 32) \
+#     --set postgresql.auth.password=<db-password> \
+#     --set postgresql.auth.postgres-password=<db-password>
+#
+#   Or clone the chart first:
+#     git clone https://github.com/BerriAI/litellm.git /tmp/litellm
+#     helm install litellm /tmp/litellm/deploy/charts/litellm-helm \
+#       -f k8s/litellm-values.yaml -n llm \
+#       --set masterkey=$(openssl rand -hex 32) \
+#       --set postgresql.auth.password=<db-password> \
+#       --set postgresql.auth.postgres-password=<db-password>
+#
+# Prerequisites:
+#   - vLLM Helm releases installed (vllm-embedding, vllm-chat) in the `llm` namespace
+
+replicaCount: 2                       # stateless — run 2 for availability
+
+image:
+  # litellm-database image includes Prisma for usage tracking + key management.
+  # Use ghcr.io/berriai/litellm if you don't need a database.
+  repository: ghcr.io/berriai/litellm-database
+  pullPolicy: IfNotPresent
+  tag: "v1.72.0"                      # pin to a specific version
+
+# -- Master key for admin API and generating team keys.
+# Set via --set on the command line rather than committing here.
+# masterkey: ""
+
+# -- Or reference an existing secret:
+# masterkeySecretName: "litellm-secrets"
+# masterkeySecretKey: "master-key"
+
+# ---------------------------------------------------------------------------
+# LiteLLM proxy configuration — rendered as config.yaml inside the pod
+# ---------------------------------------------------------------------------
+proxy_config:
+  model_list:
+    # Embedding model — served by the vllm-embedding Helm release.
+    # K8s service DNS: <release>-vllm.<namespace>.svc.cluster.local
+    - model_name: qwen3-embed
+      litellm_params:
+        model: openai/Qwen3-Embedding-8B
+        api_base: http://vllm-embedding-vllm.llm.svc.cluster.local:80/v1
+        api_key: unused
+
+    # Chat completion model — served by the vllm-chat Helm release.
+    - model_name: qwen3-chat
+      litellm_params:
+        model: openai/Qwen3-8B
+        api_base: http://vllm-chat-vllm.llm.svc.cluster.local:80/v1
+        api_key: unused
+
+  general_settings:
+    master_key: os.environ/PROXY_MASTER_KEY
+    health_check_interval: 30
+
+  router_settings:
+    routing_strategy: latency-based-routing
+    num_retries: 2
+    allowed_fails: 2
+    timeout: 300
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP                     # use Ingress for external access
+  port: 4000
+
+# ---------------------------------------------------------------------------
+# Ingress — uncomment and configure for a clean domain
+# K3s ships with Traefik, so className: "traefik" works out of the box.
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: "traefik"
+  annotations: {}
+  hosts:
+    - host: llm.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: llms-tls
+  #    hosts:
+  #      - llm.example.com
+
+# ---------------------------------------------------------------------------
+# Probes — tuned for LiteLLM startup time
+# ---------------------------------------------------------------------------
+startupProbe:
+  path: /health/readiness
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 24                # up to 2 minutes
+
+livenessProbe:
+  path: /health/liveliness
+  initialDelaySeconds: 0
+  periodSeconds: 15
+  failureThreshold: 3
+  timeoutSeconds: 10
+
+readinessProbe:
+  path: /health/readiness
+  initialDelaySeconds: 0
+  periodSeconds: 10
+  failureThreshold: 3
+  timeoutSeconds: 10
+
+# ---------------------------------------------------------------------------
+# Resources — LiteLLM is lightweight (no GPU)
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2
+    memory: 1Gi
+
+# ---------------------------------------------------------------------------
+# Database — the chart can deploy a standalone Postgres for usage tracking,
+# API key management, and spend logging. Disable if you don't need these.
+# ---------------------------------------------------------------------------
+db:
+  useExisting: false                  # set true + fill endpoint/secret to use existing PG
+  deployStandalone: true              # chart deploys a single-node Postgres
+
+postgresql:
+  architecture: standalone
+  auth:
+    username: litellm
+    database: litellm
+    # Override on the command line:
+    #   --set postgresql.auth.password=<password>
+    #   --set postgresql.auth.postgres-password=<password>
+    password: "change-me"
+    postgres-password: "change-me"
+
+# ---------------------------------------------------------------------------
+# Scaling — disabled by default for a 2-node setup
+# ---------------------------------------------------------------------------
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 80
+
+# ---------------------------------------------------------------------------
+# Optional extras
+# ---------------------------------------------------------------------------
+nodeSelector: {}                      # LiteLLM can run on any node
+tolerations: []
+affinity: {}
+
+# Redis for caching (requires cache: true in proxy_config)
+redis:
+  enabled: false

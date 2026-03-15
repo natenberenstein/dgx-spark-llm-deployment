@@ -1,0 +1,169 @@
+# LiteLLM Gateway — Kubernetes manifests
+#
+# Deploys LiteLLM as a proxy in front of the vLLM services.
+# No GPU needed — runs on any node in the cluster.
+#
+# Apply:
+#   kubectl apply -f k8s/litellm.yaml -n llm
+#
+# Prerequisites:
+#   - vLLM Helm releases installed (vllm-embedding, vllm-chat)
+#   - Create the master key secret:
+#       kubectl create secret generic litellm-secrets -n llm \
+#         --from-literal=master-key=$(openssl rand -hex 32)
+#
+# Access:
+#   kubectl port-forward svc/litellm 4000:4000 -n llm
+#   curl http://localhost:4000/health
+#
+# Production access (K3s):
+#   Option A: NodePort (already configured below, port 30400)
+#   Option B: Traefik IngressRoute (see commented-out section at bottom)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+data:
+  config.yaml: |
+    model_list:
+      # Embedding model — served by the vllm-embedding Helm release.
+      # The K8s service name follows the pattern: <release>-vllm
+      - model_name: qwen3-embed
+        litellm_params:
+          model: openai/Qwen3-Embedding-8B
+          api_base: http://vllm-embedding-vllm.llm.svc.cluster.local:80/v1
+          api_key: unused
+
+      # Chat completion model — served by the vllm-chat Helm release.
+      - model_name: qwen3-chat
+        litellm_params:
+          model: openai/Qwen3-8B
+          api_base: http://vllm-chat-vllm.llm.svc.cluster.local:80/v1
+          api_key: unused
+
+    general_settings:
+      master_key: os.environ/LITELLM_MASTER_KEY
+      health_check_interval: 30
+
+    router_settings:
+      routing_strategy: latency-based-routing
+      num_retries: 2
+      allowed_fails: 2
+      timeout: 300
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  labels:
+    app: litellm
+spec:
+  replicas: 2                        # LiteLLM is stateless — run 2 for availability
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+    spec:
+      containers:
+        - name: litellm
+          # Pin to a specific release.
+          # Check https://github.com/BerriAI/litellm/releases for latest stable.
+          image: ghcr.io/berriai/litellm:v1.72.0
+          args:
+            - "--config"
+            - "/app/config.yaml"
+            - "--port"
+            - "4000"
+          ports:
+            - containerPort: 4000
+              name: http
+          env:
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: master-key
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 2
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /health/readiness
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 24       # up to 2 minutes to start
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 4000
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 4000
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: litellm-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  labels:
+    app: litellm
+spec:
+  type: NodePort                      # accessible at <any-node-ip>:30400
+  selector:
+    app: litellm
+  ports:
+    - port: 4000
+      targetPort: 4000
+      nodePort: 30400                 # fixed port for predictable access
+      protocol: TCP
+      name: http
+
+# --- Optional: Traefik IngressRoute for a clean domain name ---
+# K3s ships with Traefik. Uncomment to expose LiteLLM at llm.example.com.
+# Prerequisites:
+#   - Internal DNS A record: llm.example.com → <any K3s node IP>
+#   - For HTTPS: create a TLS secret from your internal CA certificate:
+#       kubectl create secret tls llms-tls -n llm \
+#         --cert=llm.example.com.crt --key=llm.example.com.key
+#
+# ---
+# apiVersion: traefik.io/v1alpha1
+# kind: IngressRoute
+# metadata:
+#   name: litellm
+# spec:
+#   entryPoints:
+#     - web                           # port 80
+#     # - websecure                   # port 443 (uncomment for HTTPS)
+#   routes:
+#     - match: Host(`llm.example.com`)
+#       kind: Rule
+#       services:
+#         - name: litellm
+#           port: 4000
+#   # tls:
+#   #   secretName: llms-tls
