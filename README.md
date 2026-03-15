@@ -55,6 +55,7 @@ k8s/                      # Alternative: deploy on Kubernetes (K3s)
 - [Part 3: Client Integration](#part-3-client-integration)
 - [Monitoring and Observability](#monitoring-and-observability)
 - [Quantization: Running Larger Models](#quantization-running-larger-models)
+- [Benchmarking: Measuring Performance](#benchmarking-measuring-performance)
 - [Zero-Downtime Model Updates](#zero-downtime-model-updates)
 - [Redundancy and Failure Handling](#redundancy-and-failure-handling)
 - [Troubleshooting](#troubleshooting)
@@ -111,16 +112,63 @@ Each DGX Spark system provides:
 
 **Key architectural note:** The DGX Spark uses a **unified memory architecture** — CPU and GPU share the same 128 GB address space. There is no separate VRAM. This eliminates CPU-to-GPU transfer overhead but means all system processes share the memory pool.
 
-### What Fits on a DGX Spark?
+### Model Sizing: What Fits on a DGX Spark?
 
-| Model | Precision | Memory Required | Fits? |
+Rather than a fixed table, use this formula to evaluate **any** model:
+
+#### Step 1: Estimate model weight memory
+
+```
+Model weight memory = parameters × bytes_per_parameter
+```
+
+| Precision | Bytes per param | Formula | Example (72B model) |
 |---|---|---|---|
-| Qwen3-Embedding-8B | FP16 | ~16 GB | Yes — plenty of headroom |
-| Qwen3-8B | FP16 | ~16 GB | Yes |
-| Qwen3-32B | FP16 | ~64 GB | Yes, with limited KV cache |
-| Qwen3-30B-A3B (MoE) | FP16 | ~60 GB | Yes — only 3B active params |
-| Qwen3-72B | INT4 (GPTQ/AWQ) | ~36 GB | Yes, quantized |
-| Qwen3-72B | FP16 | ~144 GB | No — exceeds 128 GB |
+| FP32 | 4.0 | `72B × 4` | 288 GB |
+| FP16 / BF16 | 2.0 | `72B × 2` | 144 GB |
+| FP8 | 1.0 | `72B × 1` | 72 GB |
+| INT4 (GPTQ/AWQ) | 0.5 | `72B × 0.5` | 36 GB |
+
+For **Mixture-of-Experts (MoE)** models, all expert weights are loaded into memory even though only a subset is active per token. Use the *total* parameter count (e.g., Qwen3-235B-A22B has 235B total params, not 22B).
+
+#### Step 2: Estimate KV cache memory
+
+The KV cache stores attention states for all in-flight sequences. Its size depends on context length, batch size, and model architecture:
+
+```
+KV cache per token = 2 × num_layers × num_kv_heads × head_dim × bytes_per_param
+```
+
+For a rough estimate: **KV cache ≈ 1-2 MB per token at FP16** for a typical 70B model. At `--max-model-len 8192` with 16 concurrent sequences:
+
+```
+KV cache ≈ 8192 × 16 × 1.5 MB ≈ ~192 MB × 16 ≈ ~3 GB
+```
+
+This grows quickly with longer contexts or more concurrent requests.
+
+#### Step 3: Check total against available memory
+
+```
+Total ≈ model weights + KV cache + overhead (~2-5 GB for vLLM runtime)
+Available ≈ 128 GB - OS/Docker overhead (~10 GB) = ~118 GB usable
+```
+
+**Rule of thumb:** if model weights alone exceed **100 GB**, you'll have very little KV cache headroom and should quantize or reduce `--max-model-len`.
+
+#### Quick Reference
+
+| Model | Params | FP16 | INT4 | Fits (FP16)? | Fits (INT4)? |
+|---|---|---|---|---|---|
+| Qwen3-8B | 8B | 16 GB | 4 GB | Yes | Yes |
+| Qwen3-32B | 32B | 64 GB | 16 GB | Yes (limited KV) | Yes |
+| Qwen3-72B | 72B | 144 GB | 36 GB | **No** | Yes |
+| Llama-3.3-70B | 70B | 140 GB | 35 GB | **No** | Yes |
+| Qwen3-30B-A3B (MoE) | 30B total | 60 GB | 15 GB | Yes | Yes |
+| Qwen3-235B-A22B (MoE) | 235B total | 470 GB | 118 GB | **No** | Tight |
+| Nemotron-3-Super-120B-A12B | 120B total | 240 GB | 60 GB | **No** | Yes |
+
+> **Tip:** Check the model's `config.json` for exact values of `num_hidden_layers`, `num_key_value_heads`, and `hidden_size` to compute precise KV cache estimates.
 
 ## Prerequisites
 
@@ -945,16 +993,43 @@ Grafana is available at `http://<host>:3000` (default login: `admin` / `admin`).
 
 Quantization reduces the precision of model weights (e.g., FP16 to INT4), dramatically cutting memory usage with minimal quality loss. On DGX Spark's 128 GB unified memory, quantization is what unlocks 70B+ models.
 
-### Why Quantize?
+### When to Quantize
 
-| Model | FP16 Memory | INT4 (GPTQ/AWQ) Memory | Fits on DGX Spark? |
+Use the memory formula from the [Model Sizing](#model-sizing-what-fits-on-a-dgx-spark) section. If the model doesn't fit in FP16, quantization is your only option (short of multi-node tensor parallelism). But even when FP16 fits, quantization can be worthwhile for the extra KV cache headroom.
+
+```
+Do I need to quantize?
+
+  Model weights (FP16) fit in ~100 GB?
+  ├── YES → Use FP16. Maximum quality, no trade-offs.
+  │         Consider quantization anyway if you need more concurrent users
+  │         or longer context windows (the freed memory becomes KV cache).
+  │
+  └── NO  → Quantize. Choose a format:
+            │
+            Model weights (FP8) fit in ~100 GB?
+            ├── YES → Use FP8. Minimal quality loss (<0.5% on benchmarks).
+            │         Best choice for quality-sensitive tasks (code, math, reasoning).
+            │
+            └── NO  → Use INT4 (AWQ preferred, GPTQ also fine).
+                      ~1-3% quality loss on benchmarks. Unnoticeable for chat,
+                      RAG, and summarization. Always benchmark your specific
+                      use case (see the Benchmarking section below).
+```
+
+### How Much Quality Do You Lose?
+
+The impact varies by task. Tasks requiring precise reasoning are most sensitive:
+
+| Task type | FP16 → FP8 impact | FP16 → INT4 impact | Notes |
 |---|---|---|---|
-| Qwen3-8B | ~16 GB | ~4 GB | FP16: Yes, INT4: Yes |
-| Qwen3-32B | ~64 GB | ~16 GB | FP16: Yes (tight), INT4: Yes (comfortable) |
-| Qwen3-72B | ~144 GB | ~36 GB | FP16: **No**, INT4: **Yes** |
-| Qwen3-235B-A22B (MoE) | ~470 GB | ~118 GB | FP16: No, INT4: Yes (tight) |
+| **Chat / conversation** | Negligible | 1-2% | Users rarely notice |
+| **RAG / summarization** | Negligible | 1-2% | Retrieval quality unaffected |
+| **Code generation** | < 0.5% | 2-4% | Syntax errors may increase slightly |
+| **Math / reasoning** | < 1% | 3-5% | Most sensitive to quantization |
+| **Embeddings** | N/A | N/A | Embedding models are small; always use FP16 |
 
-**INT4 quantization typically loses 1-3% on benchmarks** — for most practical applications (chat, RAG, summarization), users won't notice the difference.
+These are rough ranges from published benchmarks (MMLU, HumanEval, GSM8K). **Always benchmark on your own data** — see the [Benchmarking](#benchmarking) section.
 
 ### Quantization Formats Supported by vLLM
 
@@ -1099,6 +1174,162 @@ docker exec $VLLM_CONTAINER /bin/bash -c \
 ```
 
 > **Trade-off:** Multi-node TP enables larger models (e.g., full FP16 70B across 2 nodes) but adds inter-node communication latency. For most use cases, single-node with quantization (INT4 72B on one Spark) will give better throughput. Use multi-node TP when you need full-precision weights or the model simply won't fit on one node even quantized.
+
+---
+
+## Benchmarking: Measuring Performance
+
+After choosing a model and quantization format, you need to verify that throughput and quality meet your requirements. This section covers three types of benchmarks:
+
+1. **Throughput** — How many tokens/second and concurrent requests can the model handle?
+2. **Quality** — Does the quantized model produce acceptable outputs?
+3. **A/B Comparison** — Side-by-side FP16 vs quantized evaluation.
+
+### Throughput Benchmarks
+
+vLLM ships with `benchmark_serving.py`, which simulates concurrent clients hitting the OpenAI-compatible API. This is the most realistic benchmark for production workloads.
+
+**Quick start with the included script:**
+
+```bash
+# Compare FP16 vs AWQ on the same prompts
+scripts/benchmark.sh --baseline http://spark2:8000 --candidate http://spark2:8001
+
+# Benchmark a single endpoint
+scripts/benchmark.sh --endpoint http://spark2:8000 --num-prompts 200 --concurrency 16
+```
+
+**Option A — `vllm bench` CLI** (if you have upstream vLLM installed):
+
+```bash
+pip install vllm[bench]
+
+vllm bench serve \
+  --model Qwen3-8B \
+  --host localhost --port 8000 \
+  --dataset-name random \
+  --random-input-len 512 \
+  --random-output-len 256 \
+  --num-prompts 100 \
+  --request-rate 10
+```
+
+> **Note:** The NVIDIA DGX Spark vLLM image (`nvcr.io/nvidia/vllm`) may not include the `vllm bench` subcommand. In that case, use Option B.
+
+**Option B — `benchmark_serving.py` script** (works with any vLLM deployment):
+
+```bash
+# Clone vLLM to get the benchmark script
+git clone --depth 1 https://github.com/vllm-project/vllm.git /tmp/vllm
+
+# Install minimal dependencies
+pip install aiohttp transformers
+
+# Run the benchmark against your running vLLM instance
+python /tmp/vllm/benchmarks/benchmark_serving.py \
+  --backend openai-chat \
+  --base-url http://localhost:8000 \
+  --endpoint /v1/chat/completions \
+  --model Qwen3-8B \
+  --dataset-name random \
+  --random-input-len 512 \
+  --random-output-len 256 \
+  --num-prompts 100 \
+  --request-rate 10
+```
+
+**Key metrics to watch:**
+
+| Metric | What It Means | Good Target |
+|---|---|---|
+| **TTFT** (Time to First Token) | Latency before streaming starts | < 500 ms |
+| **TPOT** (Time Per Output Token) | Per-token generation speed | < 50 ms |
+| **Throughput** (tokens/s) | Total output tokens per second | Model-dependent |
+| **Request throughput** (req/s) | Completed requests per second | Workload-dependent |
+
+**Varying concurrency to find saturation:**
+
+```bash
+for c in 1 4 8 16 32 64; do
+  echo "=== Concurrency: $c ==="
+  python /tmp/vllm/benchmarks/benchmark_serving.py \
+    --backend openai-chat \
+    --base-url http://localhost:8000 \
+    --endpoint /v1/chat/completions \
+    --model Qwen3-8B \
+    --dataset-name random \
+    --random-input-len 512 \
+    --random-output-len 256 \
+    --num-prompts $((c * 10)) \
+    --request-rate inf
+done
+```
+
+Throughput should increase with concurrency until the GPU is saturated, then plateau. If TTFT spikes sharply, you've hit the KV cache limit — lower `--max-num-seqs` or `--max-model-len`.
+
+### Quality Benchmarks
+
+Throughput is meaningless if the model produces garbage. Use `lm-evaluation-harness` to measure accuracy on standard benchmarks.
+
+```bash
+# Install
+pip install lm-eval
+
+# Run a quick evaluation against your vLLM endpoint
+lm_eval --model local-completions \
+  --model_args "model=Qwen3-8B,base_url=http://localhost:8000/v1,tokenizer_backend=huggingface" \
+  --tasks hellaswag,mmlu,gsm8k \
+  --batch_size auto \
+  --num_fewshot 5
+```
+
+**Recommended benchmark suites by use case:**
+
+| Use Case | Benchmarks | What They Measure |
+|---|---|---|
+| General chat | `hellaswag`, `arc_challenge`, `winogrande` | Common-sense reasoning |
+| RAG / knowledge | `mmlu`, `triviaqa` | Factual recall across domains |
+| Code generation | `humaneval`, `mbpp` | Code correctness |
+| Math / reasoning | `gsm8k`, `math` | Multi-step reasoning |
+
+> **Tip:** Run the same benchmarks on both FP16 and quantized variants. A drop of 1–2% is typical for AWQ INT4. If you see > 5% degradation on tasks critical to your use case, consider FP8 instead.
+
+### A/B Comparison: FP16 vs Quantized
+
+The practical workflow for evaluating quantization impact:
+
+**1. Run both models simultaneously** (using blue-green ports):
+
+```bash
+# FP16 baseline on port 8000
+GPU_MEM_UTIL=0.4 docker compose up -d vllm-chat
+
+# AWQ candidate on port 8001 (add a temporary service in docker-compose.yml)
+docker run --rm --gpus all \
+  -v /models/Qwen3-8B-AWQ:/model \
+  -p 8001:8000 \
+  nvcr.io/nvidia/vllm:26.02-py3 \
+  vllm serve /model --host 0.0.0.0 --port 8000 \
+    --enforce-eager --gpu-memory-utilization 0.4
+```
+
+**2. Run the comparison script:**
+
+```bash
+scripts/benchmark.sh \
+  --baseline http://localhost:8000 \
+  --candidate http://localhost:8001 \
+  --num-prompts 100 \
+  --concurrency 8
+```
+
+**3. Evaluate the output:**
+
+The script reports side-by-side TTFT, TPOT, throughput, and request latency percentiles (p50, p90, p99). A successful quantization should show:
+
+- Throughput: **equal or better** (INT4 moves less data → often faster)
+- TTFT: **similar or better**
+- Quality: **< 2% drop** on your critical benchmarks (check with `lm_eval`)
 
 ---
 
