@@ -1,0 +1,31 @@
+# MinIO — S3-compatible model store
+# Deploy on any machine with sufficient disk for your model weights.
+# A single 8B model in FP16 is ~16 GB; a quantized 72B model is ~36 GB.
+#
+# Usage:
+#   cp .env.example .env && nano .env
+#   docker compose up -d
+#   open http://<this-host>:9001  (MinIO Console, login with MINIO_ROOT_USER/PASSWORD)
+
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    ports:
+      - "9000:9000"     # S3 API
+      - "9001:9001"     # Web console
+    volumes:
+      - minio_data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  minio_data:

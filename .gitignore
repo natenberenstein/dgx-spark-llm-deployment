@@ -1,0 +1,16 @@
+# Environment files (contain secrets)
+.env
+
+# Model weights (too large for git)
+/models/
+*.safetensors
+*.bin
+*.pt
+*.gguf
+
+# Docker image tarballs
+*.tar
+*.tar.gz
+
+# Logs
+*.log

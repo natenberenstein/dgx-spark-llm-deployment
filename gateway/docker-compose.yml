@@ -1,0 +1,52 @@
+# Gateway — LiteLLM proxy + nginx reverse proxy
+# Deploy this on any machine on your network (no GPU needed).
+# This can run on one of the DGX Sparks or on a separate VM/server.
+#
+# Usage:
+#   cp .env.example .env && nano .env   # set LITELLM_MASTER_KEY and other values
+#   docker compose up -d
+#   docker compose logs -f
+
+services:
+  litellm:
+    # Pin to a specific release to avoid unexpected breakage from rolling tags.
+    # Check https://github.com/BerriAI/litellm/releases for the latest stable tag.
+    image: ghcr.io/berriai/litellm:${LITELLM_VERSION:-v1.72.0}
+    ports:
+      - "4000:4000"           # expose directly for debugging; nginx fronts port 80/443
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    command: >
+      --config /app/config.yaml
+      --host 0.0.0.0
+      --port 4000
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"             # only used if you uncomment the HTTPS block in nginx.conf
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # TLS certificates (only needed if enabling HTTPS in nginx.conf):
+      # - /etc/ssl/certs/llm.example.com.crt:/etc/ssl/certs/llm.example.com.crt:ro
+      # - /etc/ssl/private/llm.example.com.key:/etc/ssl/private/llm.example.com.key:ro
+    depends_on:
+      litellm:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

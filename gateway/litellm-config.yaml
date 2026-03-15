@@ -1,0 +1,49 @@
+# LiteLLM Proxy Configuration
+# Place this file at /opt/litellm/litellm-config.yaml (or adjust the volume
+# mount in docker-compose.yml accordingly).
+#
+# Replace 10.x.x.10 and 10.x.x.11 with the actual IPs of your DGX Spark nodes.
+
+model_list:
+  # --- Embedding model (primary: Spark #1) ---
+  - model_name: qwen3-embed
+    litellm_params:
+      model: openai/Qwen3-Embedding-8B
+      api_base: http://10.x.x.10:8000/v1
+      api_key: unused           # vLLM does not require auth when not configured
+
+  # --- Embedding model (backup: Spark #2, uncomment if backup service is running) ---
+  # - model_name: qwen3-embed
+  #   litellm_params:
+  #     model: openai/Qwen3-Embedding-8B
+  #     api_base: http://10.x.x.11:8001/v1
+  #     api_key: unused
+
+  # --- Chat completion model ---
+  - model_name: qwen3-chat
+    litellm_params:
+      model: openai/Qwen3-8B
+      api_base: http://10.x.x.11:8000/v1
+      api_key: unused
+
+general_settings:
+  # Set via LITELLM_MASTER_KEY in .env — never hardcode this value.
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+  # LiteLLM actively polls each backend every N seconds and returns an
+  # immediate error (instead of a timeout) if a backend is unhealthy.
+  health_check_interval: 30
+
+router_settings:
+  # "latency-based-routing" sends each request to the fastest healthy backend.
+  # This is most useful when qwen3-embed has a backup entry above.
+  routing_strategy: latency-based-routing
+
+  # Retry on a different backend before returning an error to the client.
+  num_retries: 2
+
+  # Mark a backend unhealthy after this many consecutive failures.
+  allowed_fails: 2
+
+  # Timeout per individual backend request (seconds).
+  timeout: 300

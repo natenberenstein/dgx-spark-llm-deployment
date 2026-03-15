@@ -1,0 +1,21 @@
+# Prometheus scrape configuration
+# Replace 10.x.x.10 and 10.x.x.11 with the actual IPs of your DGX Spark nodes.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: vllm-embedding
+    static_configs:
+      - targets: ["10.x.x.10:8000"]
+        labels:
+          node: spark1
+          model: qwen3-embedding
+
+  - job_name: vllm-chat
+    static_configs:
+      - targets: ["10.x.x.11:8000"]
+        labels:
+          node: spark2
+          model: qwen3-chat

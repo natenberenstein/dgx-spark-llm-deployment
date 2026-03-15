@@ -1,0 +1,41 @@
+# Monitoring stack — Prometheus + Grafana
+# Deploy this on any host that can reach the DGX Spark nodes on port 8000.
+#
+# Usage:
+#   docker compose up -d
+#   open http://<this-host>:3000  (Grafana, default login: admin / admin)
+#
+# After logging into Grafana:
+#   1. Add a Prometheus data source pointing to http://prometheus:9090
+#   2. Import a vLLM dashboard — search https://grafana.com/grafana/dashboards/
+#      for "vllm" or build your own using the key metrics listed in the README.
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:

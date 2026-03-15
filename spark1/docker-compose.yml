@@ -1,0 +1,55 @@
+# DGX Spark #1 — Embedding Model
+# Deploy this file on the node dedicated to serving the embedding model.
+#
+# Two ways to load the model:
+#   A) Local disk (default) — clone or sync the model to /models/ first
+#   B) S3/MinIO — vLLM pulls weights on startup
+#
+# Usage:
+#   cp .env.example .env && nano .env   # set VLLM_VERSION and MODEL_PATH
+#   docker compose up -d
+#   docker compose logs -f
+
+services:
+  vllm-embedding:
+    image: nvcr.io/nvidia/vllm:${VLLM_VERSION:-26.02-py3}
+    runtime: nvidia
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${MODEL_PATH:-/models/Qwen3-Embedding-8B}:/model
+    # To load from S3/MinIO instead of a local volume mount:
+    #   1. Remove the "volumes" block above
+    #   2. Uncomment the "environment" block below
+    #   3. Change the vllm serve command from "/model" to "s3://models/Qwen3-Embedding-8B"
+    # environment:
+    #   - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}
+    #   - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}
+    #   - AWS_ENDPOINT_URL=http://${MINIO_HOST:-10.x.x.20}:9000
+    #   - S3_ENDPOINT_URL=http://${MINIO_HOST:-10.x.x.20}:9000
+    command: >
+      vllm serve /model
+        --task embed
+        --host 0.0.0.0
+        --port 8000
+        --max-model-len ${MAX_MODEL_LEN:-8192}
+        --max-num-seqs ${MAX_NUM_SEQS:-256}
+        --enforce-eager
+        --dtype float16
+        --gpu-memory-utilization ${GPU_MEM_UTIL:-0.9}
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # vLLM takes 1–3 minutes to load the model before it accepts requests.
+      # If using S3/MinIO, increase this — the download adds time.
+      start_period: 180s

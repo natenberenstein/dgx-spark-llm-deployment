@@ -1,0 +1,85 @@
+# DGX Spark #2 — Chat Completion Model
+# Deploy this file on the node dedicated to serving the chat model.
+#
+# Two ways to load the model:
+#   A) Local disk (default) — clone or sync the model to /models/ first
+#   B) S3/MinIO — vLLM pulls weights on startup (see commented-out env vars below)
+#
+# Usage:
+#   cp .env.example .env && nano .env   # set VLLM_VERSION and MODEL_PATH
+#   docker compose up -d
+#   docker compose logs -f
+
+services:
+  vllm-chat:
+    image: nvcr.io/nvidia/vllm:${VLLM_VERSION:-26.02-py3}
+    runtime: nvidia
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${MODEL_PATH:-/models/Qwen3-8B}:/model
+    # To load from S3/MinIO instead, see spark1/docker-compose.yml for the pattern.
+    # environment:
+    #   - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}
+    #   - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_KEY}
+    #   - AWS_ENDPOINT_URL=http://${MINIO_HOST:-10.x.x.20}:9000
+    #   - S3_ENDPOINT_URL=http://${MINIO_HOST:-10.x.x.20}:9000
+    command: >
+      vllm serve /model
+        --host 0.0.0.0
+        --port 8000
+        --max-model-len ${MAX_MODEL_LEN:-8192}
+        --max-num-seqs ${MAX_NUM_SEQS:-256}
+        --enforce-eager
+        --dtype float16
+        --gpu-memory-utilization ${GPU_MEM_UTIL:-0.9}
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
+  # Optional: backup embedding instance on this node.
+  # Uncomment if you want failover for RAG pipelines when Spark #1 is down.
+  # Uses 15% GPU memory (~19 GB) — leaves ~109 GB for vllm-chat above.
+  # You must also lower vllm-chat's GPU_MEM_UTIL to 0.7 to fit both.
+  #
+  # vllm-embedding-backup:
+  #   image: nvcr.io/nvidia/vllm:${VLLM_VERSION:-26.02-py3}
+  #   runtime: nvidia
+  #   ports:
+  #     - "8001:8001"
+  #   volumes:
+  #     - /models/Qwen3-Embedding-8B:/model
+  #   command: >
+  #     vllm serve /model
+  #       --task embed
+  #       --host 0.0.0.0
+  #       --port 8001
+  #       --max-model-len 4096
+  #       --enforce-eager
+  #       --dtype float16
+  #       --gpu-memory-utilization 0.15
+  #   restart: unless-stopped
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
+  #     interval: 30s
+  #     timeout: 5s
+  #     retries: 3
+  #     start_period: 180s
